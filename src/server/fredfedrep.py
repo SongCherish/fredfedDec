@@ -89,6 +89,11 @@ class FredFedRepServer(FedAvgServer):
         self.split_round_list=[]
 
         self.clients_model_params_diff = [None for _ in self.train_clients]
+        self.encoder_model_param_names = tuple(
+            name for name in self.public_model_param_names if "classifier" not in name
+        )
+        if not self.encoder_model_param_names:
+            raise ValueError("FredFedRep requires at least one encoder parameter.")
         self.similarity_matrix = np.eye(len(self.train_clients))
         self.client_clusters = [list(range(len(self.train_clients)))]
 
@@ -96,10 +101,19 @@ class FredFedRepServer(FedAvgServer):
         client_packages = self.trainer.train()
 
         for client_id in self.selected_clients:
-            self.clients_model_params_diff[client_id] = [
-                -diff
-                for diff in client_packages[client_id]["model_params_diff"].values()
-            ]
+            uploaded_diff = client_packages[client_id]["model_params_diff"]
+            missing_names = set(self.encoder_model_param_names).difference(uploaded_diff)
+            if missing_names:
+                raise KeyError(
+                    f"Client {client_id} omitted encoder residuals: "
+                    f"{sorted(missing_names)}"
+                )
+            # Filter defensively at the server boundary as well.  This keeps
+            # classifier residuals out of vectorizeAndDct even if an older
+            # client sends a full-model update.
+            self.clients_model_params_diff[client_id] = OrderedDict(
+                (name, -uploaded_diff[name]) for name in self.encoder_model_param_names
+            )
 
         self.compute_pairwise_similarity()
         client_clusters_new = []
@@ -195,15 +209,22 @@ class FredFedRepServer(FedAvgServer):
             weights = torch.ones(len(model_params_diff_list)) * (
                 1 / len(model_params_diff_list)
             )
-            aggregated_diff = [
-                torch.sum(torch.stack(diff, dim=-1) * weights, dim=-1)
-                for diff in zip(*model_params_diff_list)
-            ]
+            aggregated_diff = OrderedDict(
+                (
+                    name,
+                    torch.sum(
+                        torch.stack(
+                            [client_diff[name] for client_diff in model_params_diff_list],
+                            dim=-1,
+                        )
+                        * weights,
+                        dim=-1,
+                    ),
+                )
+                for name in self.encoder_model_param_names
+            )
             for i in cluster:
-                for key, diff in zip(self.public_model_param_names, aggregated_diff):
-                    if "classifier" in key:#全局聚合不更新头部
-                        # print(key)
-                        continue
+                for key, diff in aggregated_diff.items():
                     self.clients_personal_model_params[i][key].data += diff
 
         self.clients_model_params_diff = [None for _ in self.train_clients]
@@ -413,7 +434,9 @@ class FredFedRepServer(FedAvgServer):
 
 
 @torch.no_grad()
-def compute_max_diff_norm(model_params_diff: list[list[torch.Tensor]]):
+def compute_max_diff_norm(
+    model_params_diff: list[OrderedDict[str, torch.Tensor] | None],
+):
     flag = False
     for diff in model_params_diff:
         if diff is not None:
@@ -431,7 +454,9 @@ def compute_max_diff_norm(model_params_diff: list[list[torch.Tensor]]):
 
 
 @torch.no_grad()
-def compute_mean_diff_norm(model_params_diff: list[list[torch.Tensor]]):
+def compute_mean_diff_norm(
+    model_params_diff: list[OrderedDict[str, torch.Tensor] | None],
+):
     flag = False
     for diff in model_params_diff:
         if diff is not None:

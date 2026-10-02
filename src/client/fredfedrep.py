@@ -5,6 +5,22 @@ class FredFedRepClient(FedPerClient):
     def __init__(self, **commons):
         super().__init__(**commons)
 
+    def package(self):
+        """Upload encoder residuals only.
+
+        The classifier is personalized in FredFedRep.  In particular, its
+        residual must not be part of the update used by the server for DCT or
+        clustering.
+        """
+        client_package = super().package()
+        if self.return_diff:
+            client_package["model_params_diff"] = {
+                name: diff
+                for name, diff in client_package["model_params_diff"].items()
+                if "classifier" not in name
+            }
+        return client_package
+
     def fit(self):
         self.model.train()
         self.dataset.train()
